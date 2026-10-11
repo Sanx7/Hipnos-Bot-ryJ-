@@ -1,0 +1,14 @@
+node_modules/
+auth/
+comandos/dados/temp/
+*.exe
+mensagens.db
+mensagens.db-wal
+mensagens.db-shm
+# Variáveis de ambiente (contêm números dos donos — nunca subir pro git)
+.env
+# Log gerado pelo script de teste do /play
+teste-play.log
+# Backup do migrador do /ranking (LID → número real): nome com data e
+# documentos do banco de produção — nunca versionar.
+backup-*.json

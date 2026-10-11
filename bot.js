@@ -1,0 +1,966 @@
+// ============================================================
+// ⚠️ REDE DE SEGURANÇA DO PROCESSO — o mais cedo possível!
+// ============================================================
+// Registrados ANTES de qualquer outro require/lógica rodar: qualquer erro
+// que vaze para o nível do processo é apenas LOGADO — nenhum dos dois
+// handlers chama process.exit(); o bot permanece vivo (evita reescanear o
+// QR Code) e os try/catch dos níveis inferiores continuam valendo.
+process.on('uncaughtException', (erro) => {
+  console.error('⚠️ Exceção não capturada (processo mantido vivo):', erro)
+})
+
+process.on('unhandledRejection', (motivo, promise) => {
+  console.error('⚠️ Promise rejeitada sem tratamento (processo mantido vivo):', motivo)
+  console.error('   ↳ Origem da promise:', promise)
+})
+
+// 🔕 RUÍDO DO LIBSIGNAL (dependência da Baileys): avisos como
+// "Closing session: SessionEntry {...}" são impressos com console.info
+// AVULSO e despejam o objeto da sessão Signal — com as chaves criptográficas
+// — no log a cada renegociação de sessão (rotina normal de envio, NÃO é
+// erro). Este módulo compacta esses avisos numa linha; detalhes e porquê
+// em func/log-signal.js. Instalado ANTES de qualquer require da Baileys.
+require('./func/log-signal')
+
+const {
+  default: makeWASocket,
+  initAuthCreds,
+  DisconnectReason
+} = require('@whiskeysockets/baileys')
+
+// 🗄️ SESSÃO NO MONGODB — substitui a pasta ./auth (useMultiFileAuthState),
+// que se perdia a cada redeploy/restart do Render (filesystem efêmero),
+// forçando novo QR Code. Detalhes e fixes de integração: sessao-mongo.js
+const { useMongoDBAuthState } = require('mongo-baileys')
+const { obterColecaoAuth } = require('./sessao-mongo')
+
+const P = require('pino')
+const qrcode = require('qrcode-terminal')
+const fs = require('fs')
+const path = require('path')
+
+// 📊 Registro do ranking (/ranking). 🪪 LID→número real resolvido ANTES de
+// gravar: o ranking-registro.js tenta mapear o identificador @lid para o
+// telefone (mesma prova do lid.js: nota-lid + @lid do participante no grupo);
+// sem prova, grava pelo LID com o campo auxiliar `lid` (migrável depois).
+// Nunca lança — o ranking é acessório e não pode derrubar o fluxo do bot.
+const rankingRegistro = require('./ranking-registro')
+
+// 📝 Extração do texto/LEGENDA da mensagem (dados/texto-comando.js) — é o que
+// permite mandar a foto com "/s" na legenda e o comando ser roteado (antes só
+// o fluxo de reply funcionava: legenda não é conversation nem
+// extendedTextMessage.text). Módulo separado p/ poder ser testado sem subir o bot.
+const { extrairTextoComando } = require('./dados/texto-comando')
+
+// 🗞️ CAPTURA DIÁRIA (/jornal): registra texto de grupos p/ o resumo do dia.
+// Memória (Map por jid) + espelho Mongo com TTL (sobrevive ao restart).
+// Nunca lança: qualquer falha é logada e o fluxo segue.
+const capturaDiaria = require('./dados/captura-diaria')
+
+// 🗑️ ANTI-APAGADA: cache temporário (~2h) + reenvio de "apagar para todos".
+// Memória (Map por msg.key.id) + histórico do dia no Mongo com TTL.
+// Nunca lança: captura e reenvio são acessórios e não bloqueiam o fluxo.
+const cacheMensagens = require('./dados/cache-mensagens')
+const { tratarRevogacao } = require('./dados/reenvio-apagadas')
+const { antiApagadaHabilitada } = require('./configuracoes-grupo')
+const moderacaoFigurinhas = require('./dados/moderacao-figurinhas')
+const moderacaoAntilinkHard = require('./dados/moderacao-antilinkhard')
+const moderacaoAntiflood = require('./dados/moderacao-antiflood')
+const moderacaoLimiteCaractere = require('./dados/moderacao-limitecaractere')
+const moderacaoAntigolpe = require('./dados/moderacao-antigolpe')
+const { temLinkBasico } = require('./dados/deteccao-links')
+
+// ⚙️ Configurações globais do bot
+// - OWNER_NUMBERS: lista de donos SEMPRE pode usar os comandos (mesmo no modo restrito)
+// - AVISAR_BLOQUEIO: true = avisa não-admin | false = ignora silenciosamente
+// - limparNumero / ehAdminDoGrupo / ehDonoDoBot: helpers p/ verificar admin
+//   de grupo e dono do bot (ehDonoDoBot resolve o LID do sender nos metadados)
+const { OWNER_NUMBERS, AVISAR_BLOQUEIO, limparNumero, ehAdminDoGrupo, ehDonoDoBot } = require('./config')
+
+// 💤 SISTEMA AFK (afk.js): marcação de ausente (/afk), aviso automático
+// quando alguém menciona/responde a um usuário AFK e remoção automática
+// quando o próprio usuário volta a falar. MongoDB — persiste entre redeploys.
+const {
+  definirAfk,
+  removerAfk,
+  buscarVariosAfk,
+  resolverJidAfk,
+  formatarDuracao,
+  MOTIVO_PADRAO
+} = require('./afk')
+
+// 🤖 IA INTERATIVA (ia-interativa.js): respostas automáticas quando alguém
+// MENCIONA o bot ou RESPONDE a uma mensagem dele. O toggle por grupo
+// (/ia-interativa 1|0 — MongoDB) é checado ANTES de qualquer chamada de API.
+const { processarGatilhoIA } = require('./ia-interativa')
+
+// ⏰ AGENDADOR DE LEMBRETES (lembretes.js): verifica o Mongo a cada 30s e
+// entrega os vencidos. O socket ativo é registrado a cada (re)conexão
+// (iniciarAgendadorLembretes) para o disparo sobreviver a reconexões; se o
+// Mongo falhar, ele apenas loga e tenta de novo no próximo ciclo.
+const { iniciarAgendadorLembretes } = require('./lembretes')
+
+// 🪪 Resolução LID→número real (lid.js) — usada pela anti-blacklist: a entrada
+// pode chegar como "@lid" (identificador novo do WhatsApp) enquanto o
+// blacklist.json guarda números REAIS.
+const { ehLid, resolverLidParaTelefone } = require('./lid')
+
+// 🗄️ Configurações POR GRUPO no MongoDB (hoje: liga/desliga do /welcome).
+// welcomeHabilitado(grupoId) é a checagem usada pelo handler de entrada de
+// membros (group-participants.update) antes de saudar — NUNCA lança.
+const { welcomeHabilitado } = require('./configuracoes-grupo')
+
+// 🌙 BOAS-VINDAS COM BANNER (boasvindas.js): monta a arte com a foto do novo
+// membro na moldura do banner (jimp — JS puro) + a legenda do grupo
+// (customizada via /legendabv ou a padrão). NUNCA lança: em qualquer falha
+// ele mesmo cai para uma saudação em TEXTO.
+const { enviarBoasVindas, registrarSocketBoasVindas } = require('./boasvindas')
+
+// ====================
+// CONFIGURAÇÃO DO EXPRESS (PARA O RENDER)
+// ====================
+const express = require('express');
+const app = express();
+const port = process.env.PORT || 3000;
+
+let linkDoQrCode = '';
+
+// Rota web onde você vai abrir no navegador para ler o QR Code
+app.get('/', (req, res) => {
+  if (linkDoQrCode) {
+    res.send(`
+      <div style="text-align: center; font-family: sans-serif; margin-top: 50px;">
+        <h1>🌌 Hipnos Bot - Escaneie o QR Code</h1>
+        <img src="${linkDoQrCode}" style="border: 4px solid #000; padding: 10px; background: white;" />
+        <p style="color: #555;">Atualize a página se o código expirar no seu celular.</p>
+      </div>
+    `);
+  } else {
+    res.send(`
+      <div style="text-align: center; font-family: sans-serif; margin-top: 50px;">
+        <h1>🌙 Hipnos Bot</h1>
+        <p>O bot já está conectado ou o QR Code ainda não foi gerado pelo servidor.</p>
+      </div>
+    `);
+  }
+});
+
+// Inicializa o servidor web exigido pelo Render
+app.listen(port, () => {
+  console.log(`🌐 Servidor de autenticação online na porta ${port}`);
+});
+
+// ====================
+// CARREGAR COMANDOS
+// ====================
+
+// 📚 O Map de comandos vive em comandos-registry.js (módulo compartilhado).
+// Assim outros módulos (ex.: o /info) conseguem contar/consultar os comandos
+// carregados pelo loader SEM dar require no bot.js — o que criaria uma
+// dependência circular (comando -> bot -> comando) durante o carregamento.
+const { comandos } = require('./comandos-registry')
+
+// 🔤 PREFIXO DINÂMICO dos comandos (FONTE ÚNICA: prefixo.js — MongoDB).
+// O roteador NÃO tem mais "/" fixo: o que vale é o prefixo configurado
+// (troca em tempo real pelo /set-prefix, sem reiniciar o bot). Validação,
+// persistência e cache vivem todos em prefixo.js — aqui só consumimos.
+const prefixoComandos = require('./prefixo')
+const respostaPrefixo = require('./dados/resposta-prefixo')
+const estadoBot = require('./estado-bot')
+const mensagensEnviadas = require('./dados/mensagens-enviadas')
+
+// 🎮 Registro COMPARTILHADO de jogos por grupo (dados/jogos-ativos.js).
+// Duas responsabilidades que o bot.js usa aqui:
+//   1) 🔒 um jogo ativo por grupo (bloqueio cruzado /velha × /anagrama × /gartic);
+//   2) 💬 entregar as mensagens de TEXTO LIVRE (sem o prefixo de comando) aos
+//      jogos que dependem de ler palpites, como o /gartic.
+// Módulo sem dependências → pode ser exigido pelo bot.js sem ciclo.
+const { processarMensagemLivre } = require('./dados/jogos-ativos')
+
+// Verifica se um JID está ativo na config aceitando tanto camelCase (novo padrão)
+// quanto minúsculas (dados antigos), evitando quebra de compatibilidade.
+function configAtiva(configs, chaveCamelCase, chaveMinuscula, id) {
+  return Boolean(
+    configs?.[chaveCamelCase]?.includes(id) ||
+    configs?.[chaveMinuscula]?.includes(id)
+  )
+}
+
+// 👑 O remetente é DONO DO BOT? (usado pelas automações que removem o sender)
+// Mesmo padrão PROOF-LID do modo restrito: 1º teste direto com o número real
+// (zero custo de API); se não bater, busca os metadados e resolve via
+// ehDonoDoBot — cobre o caso do WhatsApp entregar o sender como "@lid".
+// Nunca lança: em falha de metadados, cai na comparação direta.
+async function ehRemetenteEhDono(sock, jid, sender) {
+  if (OWNER_NUMBERS.includes(limparNumero(sender))) return true
+  try {
+    const metadados = await sock.groupMetadata(jid)
+    return ehDonoDoBot(metadados?.participants, sender)
+  } catch (err) {
+    console.error('Erro ao buscar metadados p/ verificar dono do remetente:', err)
+    return OWNER_NUMBERS.includes(limparNumero(sender))
+  }
+}
+
+function carregarComandos(pasta) {
+  const arquivos = fs.readdirSync(pasta)
+
+  for (const arquivo of arquivos) {
+    const caminho = path.join(pasta, arquivo)
+
+    if (fs.statSync(caminho).isDirectory()) {
+      carregarComandos(caminho)
+    } else if (arquivo.endsWith('.js')) {
+      try {
+        const comando = require(caminho)
+
+        // 📦 Módulo que exporta um ARRAY de comandos (ex.: menu-brincadeira/acoes.js)
+        // Cada elemento do array é registrado independentemente no Map.
+        if (Array.isArray(comando)) {
+          for (const item of comando) {
+            if (item?.nome && item.executar) {
+              comandos.set(item.nome, item)
+              console.log(`✅ Comando carregado: ${item.nome}`)
+
+              if (Array.isArray(item.aliases)) {
+                for (const apelido of item.aliases) {
+                  if (!apelido || typeof apelido !== 'string') continue
+                  if (comandos.has(apelido)) {
+                    console.log(`⚠️ Alias ignorado (já existe): ${apelido}`)
+                    continue
+                  }
+                  comandos.set(apelido, item)
+                  console.log(`   ↳ apelido: /${apelido}`)
+                }
+              }
+            } else {
+              console.log(`⚠️ Item ignorado em ${arquivo}: sem nome/executar`)
+            }
+          }
+          continue
+        }
+
+        if (comando.nome && comando.executar) {
+          comandos.set(comando.nome, comando)
+          console.log(`✅ Comando carregado: ${comando.nome}`)
+
+          // 🏷️ ALIASES: registra apelidos extras para o MESMO módulo
+          // (ex.: /checkativo também responde a /mensagens, /msgs e /ativo).
+          // Não sobrescreve nomes já registrados — o 1º comando carregado
+          // mantém a precedência (mesma regra dos arquivos de alias).
+          if (Array.isArray(comando.aliases)) {
+            for (const apelido of comando.aliases) {
+              if (!apelido || typeof apelido !== 'string') continue
+              if (comandos.has(apelido)) {
+                console.log(`⚠️ Alias ignorado (já existe): ${apelido}`)
+                continue
+              }
+              comandos.set(apelido, comando)
+              console.log(`   ↳ apelido: /${apelido}`)
+            }
+          }
+        }
+      } catch (err) {
+        console.log(`❌ Erro ao carregar ${arquivo}`)
+        console.log(err)
+      }
+    }
+  }
+}
+
+const pastaComandos = path.join(__dirname, 'comandos')
+
+if (fs.existsSync(pastaComandos)) {
+  carregarComandos(pastaComandos)
+}
+
+// ====================
+// BOT
+// ====================
+
+// Socket atualmente ativo + controle de reconexão.
+// Objetivo: nunca abrir 2 conexões ao mesmo tempo após um erro de stream.
+let sockAtual = null
+let reconexaoAgendada = false
+let tentativas = 0
+
+async function startBot() {
+  // TRAVA ANTI-DUPLICAÇÃO: se já existe uma reconexão marcada, ignora a chamada
+  if (reconexaoAgendada) {
+    console.log('⏳ Reconexão já agendada, ignorando chamada duplicada...')
+    return
+  }
+
+  // Encerra o socket anterior (se ainda existir) antes de abrir outro
+  if (sockAtual) {
+    const antigo = sockAtual
+    sockAtual = null
+    try {
+      antigo.end(undefined)
+    } catch (err) {
+      // socket já morto — seguimos em frente
+    }
+  }
+
+  // 🗄️ SESSÃO NO MONGODB — sobrevive a redeploys/restarts do Render.
+  // A collection guarda 1 doc "auth_creds" + 1 doc por chave de sessão.
+  // Se o Mongo falhar, obterColecaoAuth lança com log ruidoso e o
+  // startBot().catch de fora mostra "Falha ao iniciar/reconectar".
+  const colecaoAuth = await obterColecaoAuth()
+
+  // Sessão NOVA? Cria as credenciais com o initAuthCreds DO PRÓPRIO Baileys
+  // (estrutura exata da versão instalada) em vez da cópia interna embutida
+  // na lib mongo-baileys, que pode ficar desatualizada em relação ao @rc.
+  const docCreds = await colecaoAuth.findOne({ _id: 'auth_creds' })
+  if (!docCreds || !docCreds.creds) {
+    await colecaoAuth.updateOne(
+      { _id: 'auth_creds' },
+      { $set: { creds: initAuthCreds() } },
+      { upsert: true }
+    )
+    console.log('🆕 Sessão nova criada no MongoDB — escaneie o QR Code abaixo (só desta vez).')
+  }
+
+  const { state, saveCreds } = await useMongoDBAuthState(colecaoAuth)
+
+  const sock = makeWASocket({
+    auth: state,
+    logger: P({ level: 'silent' })
+  })
+
+  sockAtual = sock
+  // Nenhuma automação ou comando pode remover a conta conectada, mesmo em LID.
+  require('./dados/protecao-bot').protegerRemocoes(sock)
+  // Histórico de chaves para /limpar-chat, incluindo os envios automáticos.
+  mensagensEnviadas.acompanharSocket(sock)
+  // Permite que boas-vindas pendentes reenviem pelo socket recriado.
+  registrarSocketBoasVindas(sock)
+
+  // 🔤 PREFIXO: aquece o cache com UMA leitura no MongoDB, para que a 1ª
+  //    mensagem recebida não espere o banco. FIRE-AND-FORGET de propósito:
+  //    o startBot não pode travar a conexão do Baileys esperando o Mongo.
+  prefixoComandos
+    .obterPrefixo()
+    .then((p) => console.log(`🔤 [prefixo] comandos respondendo a "${p}" (use /set-prefix para mudar)`))
+    .catch(() => { /* obterPrefixo nunca lança: este catch é só rede de segurança */ })
+
+  // ⏰ LEMBRETES: registra o socket novo + roda a checagem inicial (catch-up
+  // do que venceu com o bot offline) e arma o timer de 30s (idempotente).
+  // A checagem inicial é FIRE-AND-FORGET DE PROPÓSITO: startBot não pode
+  // travar a conexão do Baileys esperando o Mongo responder.
+  iniciarAgendadorLembretes(sock).catch((errLembretes) => {
+    console.error('⚠️ [lembretes] falha na checagem inicial (o agendador segue):', errLembretes?.message || errLembretes)
+  })
+
+  sock.ev.on('creds.update', saveCreds)
+
+  // 🚨 MONITOR AUTOMÁTICO DE ENTRADAS, SAÍDAS E ANTI-BLACKLIST
+  sock.ev.on('group-participants.update', async (atualizacao) => {
+    const { id: grupoId, participants, action } = atualizacao;
+
+    if (!participants) return;
+
+    try {
+      // --- PARTE 1: ANTI-BLACKLIST ---
+      if (action === 'add') {
+        const caminhoBL = path.join(__dirname, 'comandos', 'dados', 'blacklist.json');
+        if (fs.existsSync(caminhoBL)) {
+          const listaNegra = JSON.parse(fs.readFileSync(caminhoBL, 'utf-8'));
+
+          const normalizar = (p) => {
+            if (!p) return '';
+            const idStr = typeof p === 'object' ? (p.id || p.jid || '') : String(p);
+            return idStr.split('@')[0].split(':')[0].replace(/\D/g, '');
+          };
+
+          const intrusos = [];
+          for (const p of participants) {
+            const clean = normalizar(p);
+            // 🛡️ Donos do bot são IMUNES até à anti-blacklist automática
+            // (a proteção é sobre QUEM é o alvo, não sobre quem executou).
+            if (!clean || OWNER_NUMBERS.includes(clean)) continue;
+
+            let ehIntruso = listaNegra.includes(clean);
+
+            // 🪪 LID: a entrada pode chegar como "@lid" (identificador novo do
+            // WhatsApp). O blacklist.json guarda números REAIS — então, se o
+            // JID é @lid, resolvemos o número real pelo mapeamento da sessão
+            // (lid.js, com cache) antes de comparar. Sem isso, um banido podia
+            // entrar impune só por chegar identificado como @lid.
+            const jidEntrante = typeof p === 'object' ? (p.id || p.jid || '') : String(p);
+            if (!ehIntruso && ehLid(jidEntrante)) {
+              const numeroReal = await resolverLidParaTelefone(clean);
+              ehIntruso = Boolean(numeroReal && listaNegra.includes(numeroReal));
+            }
+
+            if (ehIntruso) intrusos.push(p);
+          }
+
+          if (intrusos.length > 0) {
+            const jidsParaRemover = intrusos.map(p => typeof p === 'object' ? (p.id || p.jid) : p);
+            await sock.groupParticipantsUpdate(grupoId, jidsParaRemover, 'remove');
+            await sock.sendMessage(grupoId, {
+              text: '💀 Hipnos rejected an outcasted soul. The limbo does not forget.'
+            });
+            return; 
+          }
+        }
+      }
+
+      // --- PARTE 2: SISTEMA DE BOAS-VINDAS / DESPEDIDAS ---
+      // 🌙 O liga/desliga vem do MongoDB, POR GRUPO (comando /welcome),
+      // via configuracoes-grupo.js — não mora mais no antias.json.
+      // welcomeHabilitado nunca lança (fail-safe: assume DESLIGADO).
+      if (await welcomeHabilitado(grupoId)) {
+
+        console.log('Atualização recebida:', participants)
+
+        // 📋 Metadados do grupo UMA única vez por atualização (antes
+        // a busca ficava DENTRO do laço: uma chamada de rede extra por membro).
+        let nomeGrupo = "Recinto"
+        let contagemMembros = "—"
+        try {
+          const metadados = await sock.groupMetadata(grupoId)
+          nomeGrupo = metadados.subject || "Recinto"
+          contagemMembros = metadados.participants.length
+        } catch (e) {
+          console.error("Erro ao obter metadados do grupo:", e)
+        }
+
+        for (const participante of participants) {
+
+          const participanteId =
+            typeof participante === 'object'
+              ? (participante.phoneNumber || participante.id || participante.jid)
+              : participante
+
+          if (!participanteId) continue
+
+          const numeroMembro = participanteId.split('@')[0]
+
+          // 📥 PORTAL DE ENTRADA (WELCOME) — BANNER + LEGENDA PERSONALIZADOS
+          // 🖼️ enviarBoasVindas (boasvindas.js) monta a arte com a foto do
+          // novo membro na moldura do banner (jimp, JS puro) + a legenda do
+          // grupo (customizada via /legendabv ou a padrão).
+          // Se QUALQUER etapa falhar (banco, rede, imagem, envio), ele mesmo
+          // cai para texto e NUNCA lança — o listener segue intacto.
+          if (action === 'add') {
+            await enviarBoasVindas(sock, {
+              grupoId,
+              participanteId,
+              nome: typeof participante === 'object'
+                ? (participante.name || participante.notify || null)
+                : null,
+              nomeGrupo,
+              totalMembros: contagemMembros
+            })
+
+          // 📤 PORTAL DE SAÍDA / DESPEDIDA (GOODBYE)
+          } else if (action === 'remove') {
+            const textoSaida = `🌑 *DESCENSO AO ESQUECIMENTO* 🌑\n\n@${numeroMembro} deixou nosso território e retornou para o mundo desperto. Que o limbo ignore seus passos. 🪐`;
+
+            await sock.sendMessage(grupoId, {
+              text: textoSaida,
+              mentions: [participanteId]
+            });
+          }
+        }
+      }
+
+    } catch (err) {
+      console.error("Erro no monitor de participantes:", err);
+    }
+  });
+
+  sock.ev.on('messages.upsert', async ({ messages, type }) => {
+    try {
+      // Moderação do lote inteiro, inclusive em OFF. Hard assume os links antes das demais regras.
+      const linksTratados = await moderacaoAntilinkHard.processarLote(sock, messages)
+      const floodsTratados = await moderacaoAntiflood.processarLote(sock, messages, type, linksTratados)
+      const textosTratados = await moderacaoLimiteCaractere.processarLote(sock, messages, type, new Set([...linksTratados, ...floodsTratados]))
+      const figurinhasTratadas = await moderacaoFigurinhas.processarLote(sock, messages.filter(msg => !linksTratados.has(`${msg?.key?.remoteJid}:${msg?.key?.id}`) && !floodsTratados.has(`${msg?.key?.remoteJid}:${msg?.key?.id}`) && !textosTratados.has(`${msg?.key?.remoteJid}:${msg?.key?.id}`)))
+      const golpesTratados = await moderacaoAntigolpe.processarLote(sock, messages, type, new Set([...linksTratados, ...floodsTratados, ...textosTratados, ...figurinhasTratadas]))
+      const msg = messages[0]
+
+      if (!msg?.message) return
+      if (msg.key.fromMe) return
+
+      const jid = msg.key.remoteJid
+      const sender = msg.key.participant || msg.key.remoteJid
+
+      // 🗑️ ANTI-APAGADA: "apagar para todos" (protocolMessage REVOKE) chega
+      // AQUI como mensagem normal — o Baileys não tem evento separado.
+      // Se o grupo tem a recuperação ligada, busca o original no cache e
+      // reenvia; sem cache = silencioso. Roda ANTES de tudo (inclusive do
+      // ranking/jornal) e nunca bloqueia o fluxo. Só grupos.
+      try {
+        if (String(jid || '').endsWith('@g.us')) {
+          const ativo = await antiApagadaHabilitada(jid)
+          if (ativo) {
+            const resultado = await tratarRevogacao(sock, msg, jid)
+            if (resultado === 'reenviado') return
+          }
+        }
+      } catch (errApagadas) {
+        console.error('[apagadas] falha no reenvio (fluxo segue normal):', errApagadas?.message || errApagadas)
+      }
+
+      // ====================
+      // 📊 REGISTRO DE MENSAGENS PARA O /RANKING
+      // ====================
+      // Captura TODA mensagem que passa pelo bot (não só comandos) e
+      // contabiliza um ponto para o remetente NAQUELE grupo (jid).
+      // Os dados vão para o SQLite (database.js) e alimentam o /ranking.
+      // O try/catch garante que o ranking nunca atrapalhe o fluxo normal.
+      if (jid.endsWith('@g.us')) {
+        try {
+          // 🪪 Resolve o @lid para o número real ANTES de registrar.
+          rankingRegistro
+            .registrarComNumeroReal(jid, sender, msg.pushName)
+            .catch((errRegistro) => {
+              console.error('❌ Erro ao registrar mensagem no ranking:', errRegistro)
+            })
+        } catch (errRegistro) {
+          console.error('❌ Erro ao registrar mensagem no ranking:', errRegistro)
+        }
+      }
+
+      // 🪐 GUARDIÕES DO LIMBO (MONITORES DE GRUPO)
+      if (linksTratados.has(`${jid}:${msg.key.id}`) || floodsTratados.has(`${jid}:${msg.key.id}`) || textosTratados.has(`${jid}:${msg.key.id}`) || figurinhasTratadas.has(`${jid}:${msg.key.id}`) || golpesTratados.has(`${jid}:${msg.key.id}`)) return
+      if (jid.endsWith('@g.us')) {
+        const caminhoConfigs = path.join(__dirname, 'comandos', 'dados', 'antias.json');
+        if (fs.existsSync(caminhoConfigs)) {
+          const configs = JSON.parse(fs.readFileSync(caminhoConfigs, 'utf-8'));
+          
+          if (configAtiva(configs, 'antiAudio', 'antiaudio', jid)) {
+            const ehAudio = msg.message.audioMessage || msg.message.extendedTextMessage?.contextInfo?.quotedMessage?.audioMessage;
+            if (ehAudio) {
+              await sock.sendMessage(jid, { delete: { remoteJid: jid, fromMe: false, id: msg.key.id, participant: sender } });
+              return; 
+            }
+          }
+
+          if (configAtiva(configs, 'antiDocument', 'antidoc', jid)) {
+            const ehDocumento = msg.message.documentMessage || msg.message.documentWithCaptionMessage || msg.message.extendedTextMessage?.contextInfo?.quotedMessage?.documentMessage;
+            if (ehDocumento) {
+              await sock.sendMessage(jid, { delete: { remoteJid: jid, fromMe: false, id: msg.key.id, participant: sender } });
+              return; 
+            }
+          }
+
+          if (configAtiva(configs, 'antiEvent', 'antievento', jid)) {
+            const ehEvento = msg.message.eventMessage || msg.message.extendedTextMessage?.contextInfo?.quotedMessage?.eventMessage;
+            if (ehEvento) {
+              await sock.sendMessage(jid, { delete: { remoteJid: jid, fromMe: false, id: msg.key.id, participant: sender } });
+              return; 
+            }
+          }
+       
+          if (configAtiva(configs, 'antiLink', 'antilink', jid)) {
+            const conteudoTexto = msg.message.conversation || msg.message.extendedTextMessage?.text || '';
+            const temLink = temLinkBasico(conteudoTexto);
+            
+            if (temLink) {
+              await sock.sendMessage(jid, { delete: { remoteJid: jid, fromMe: false, id: msg.key.id, participant: sender } });
+              return; 
+            }
+          }
+
+          if (configAtiva(configs, 'antiPayment', 'antipay', jid)) {
+            const ehPagamentoNormal = msg.message.paymentInviteMessage;
+            const ehPagamentoStealth = msg.messageStubType === 63 || msg.messageStubType === 40 || msg.messageStubType === 41;
+
+            if (ehPagamentoNormal || ehPagamentoStealth) {
+              // 🛡️ PROTEÇÃO DO DONO DO BOT: a automação também não remove o
+              // dono (vale mesmo quando o sender chega como "@lid").
+              if (await ehRemetenteEhDono(sock, jid, sender)) {
+                console.log('💤 antiPayment ignorado — o remetente é dono do bot.');
+                return;
+              }
+              await sock.sendMessage(jid, { delete: { remoteJid: jid, fromMe: false, id: msg.key.id, participant: sender } });
+              await sock.groupSettingUpdate(jid, 'announcement');
+              await sock.groupParticipantsUpdate(jid, [sender], 'remove');
+              await sock.sendMessage(jid, {
+                text: '💀⚖️ ANATEMA PROIBIDO\n\ Uma transação profana tentou se manifestar. O autor foi banido para os confins do limbo e as portas do recinto foram seladas temporariamente para purificação.'
+              });
+              return;
+            }
+          }
+
+          if (configAtiva(configs, 'antiStatus', 'antistatus', jid)) {
+            const contextInfo = msg.message.extendedTextMessage?.contextInfo || msg.message[Object.keys(msg.message)[0]]?.contextInfo;
+            const marcouStatus = contextInfo?.remoteJid === 'status@broadcast';
+
+            if (marcouStatus) {
+              // 🛡️ PROTEÇÃO DO DONO DO BOT: a automação também não remove o
+              // dono (vale mesmo quando o sender chega como "@lid").
+              if (await ehRemetenteEhDono(sock, jid, sender)) {
+                console.log('💤 antiStatus ignorado — o remetente é dono do bot.');
+                return;
+              }
+              await sock.sendMessage(jid, { delete: { remoteJid: jid, fromMe: false, id: msg.key.id, participant: sender } });
+              await sock.groupParticipantsUpdate(jid, [sender], 'remove');
+              await sock.sendMessage(jid, {
+                text: '💀⚖️ VISÃO CEGADA\n\nA tentativa de projetar histórias ou status externos dentro deste território foi interceptada. O autor foi enviado para o esquecimento.'
+              });
+              return;
+            }
+          }
+        }
+      }
+
+      // 📝 TEXTO DA MENSAGEM — fonte ÚNICA do roteador de comandos.
+      // A extração (incluindo 📸 LEGENDA de mídia: imageMessage.caption,
+      // videoMessage.caption e documentMessage.caption) vive em
+      // dados/texto-comando.js — módulo próprio e testável. Antes disso, uma
+      // foto enviada com "/s" na legenda chegava aqui com text = '' e o
+      // comando NEM era roteado (só o fluxo de reply funcionava), porque a
+      // legenda não está em conversation nem em extendedTextMessage.text.
+      // 🔓 A função usa normalizeMessageContent (view-once/temporárias/
+      // documento-com-legenda) SEM alterar msg.message: os monitores de grupo
+      // (antiDocument etc.) precisam ver a estrutura ORIGINAL.
+      const text = extrairTextoComando(msg)
+
+      // 🗞️ CAPTURA DIÁRIA (/jornal): toda mensagem de grupo entra no
+      // acumulado do dia (só texto livre; comandos/mídia são filtrados lá
+      // dentro). Roda antes de tudo e nunca bloqueia o fluxo.
+      try {
+        if (String(jid || '').endsWith('@g.us')) capturaDiaria.capturarMensagem(msg, jid)
+      } catch (errJornal) {
+        console.error('[jornal] falha na captura (fluxo segue normal):', errJornal?.message || errJornal)
+      }
+
+      // 🗑️ CACHE DE MENSAGENS (anti-apagada): guarda texto/mídia por ~2h
+      // p/ o reenvio do "apagar para todos". Fire-and-forget DE PROPÓSITO
+      // (o download da mídia não pode atrasar comandos/ranking). Respeita o
+      // toggle do grupo: desligado = nada é guardado. Só grupos.
+      try {
+        if (String(jid || '').endsWith('@g.us')) {
+          antiApagadaHabilitada(jid).then((ativo) => {
+            if (ativo) cacheMensagens.capturarMensagem(msg, jid).catch(() => {})
+          }).catch(() => {})
+        }
+      } catch (errCache) {
+        console.error('[apagadas] falha na captura (fluxo segue normal):', errCache?.message || errCache)
+      }
+
+      const muteCmd = comandos.get("mute")
+      const mutedUsers = muteCmd?.mutedUsers
+
+      if (mutedUsers?.has(sender)) {
+        return
+      }
+
+      // Manutenção GLOBAL: moderação, atividade e caches já processaram a
+      // mensagem. AFK ainda atualiza seus dados, mas só pode responder quando
+      // há autorização interativa. A barreira fica após essa atualização.
+      const podeInteragir = await estadoBot.permitirMensagem(sock, jid, sender)
+
+      // 💤━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      // 💤 SISTEMA AFK — checagem única por mensagem (UMA consulta ao Mongo)
+      // ─────────────────────────────────────────────────────────────
+      // Roda CEDO no fluxo (antes de jogos/comandos) e cobre, numa tacada só:
+      //   1) 👋 O PRÓPRIO remetente estava AFK? → remove e dá boas-vindas
+      //      de volta (qualquer mensagem conta; exceção: a própria mensagem
+      //      sendo o comando /afk, que só atualiza o motivo — sem o
+      //      remove-e-re-adiciona confuso);
+      //   2) 💤 Alguém MENCIONADO (contextInfo.mentionedJid) ou RESPONDIDO
+      //      (contextInfo.participant do quoted) está AFK? → avisa o chat,
+      //      cobrindo TODAS as pessoas AFK da mesma mensagem, não só a 1ª.
+      //
+      // 🏠 PRIVADO: não há menção em conversa individual, mas a remoção
+      // automática continua valendo. DECISÃO DE DESIGN (documentada): no
+      // privado, quando alguém escreve PARA um usuário AFK (sem comando),
+      // o bot também avisa que ele está ausente — é o análogo natural da
+      // menção no grupo e evita a impressão de que a pessoa te ignorou.
+      //
+      // ⚡ EFICIÊNCIA: remetente + todos os alvos (mencionados/respondidos)
+      // são resolvidos e consultados com UMA ÚNICA busca $in (buscarVariosAfk).
+      // 🪪 LID: menções e remetente podem chegar como "@lid" — resolvemos
+      // para o número real via afk.js→lid.js (metadados + mapeamento, com
+      // cache) antes de consultar, já que a base guarda números reais
+      // (mesmo padrão de VIP/RPG//ban//adv). Sem os metadados, o @lid cru
+      // nunca bateria com o número salvo e o aviso não era enviado.
+      // 🛡️ Nada aqui lança: falha de banco/rede é logada e o fluxo segue.
+      try {
+        // 📋 Candidatos: remetente + jids vindos de menções/reply
+        const contextoInfo =
+          msg.message.extendedTextMessage?.contextInfo ||
+          msg.message[Object.keys(msg.message)[0]]?.contextInfo ||
+          null
+
+        const jidsAlvoBrutos = [
+          ...(contextoInfo?.mentionedJid || []),
+          // Reply sem menção explícita: o autor da mensagem citada
+          ...(contextoInfo?.participant && !contextoInfo.mentionedJid?.length
+            ? [contextoInfo.participant]
+            : [])
+        ].filter(Boolean)
+
+        // 🪪 Metadados UMA vez só (para resolver @lid via phoneNumber, igual
+        // ao /darvip e ao ehDonoDoBot) — só buscamos se houver algum @lid
+        // entre remetente e alvos, para não custar 1 API call por mensagem.
+        const precisaResolverLid =
+          String(sender || '').endsWith('@lid') ||
+          jidsAlvoBrutos.some((j) => String(j || '').endsWith('@lid'))
+        let participantesAfk = null
+        if (precisaResolverLid && String(jid || '').endsWith('@g.us')) {
+          try {
+            participantesAfk = (await sock.groupMetadata(jid))?.participants || null
+          } catch (errMetaAfk) {
+            console.error('[afk] sem metadados do grupo p/ resolver @lid:', errMetaAfk?.message || errMetaAfk)
+          }
+        }
+
+        // 🪪 Resolve LID → número real (best-effort; sem mapeamento, usa o cru)
+        const numerosAlvo = []
+        for (const jidAlvo of jidsAlvoBrutos) {
+          const { numero, via } = await resolverJidAfk(participantesAfk, jidAlvo)
+          if (!numero) continue
+          if (String(jidAlvo).endsWith('@lid')) {
+            if (via) console.log(`[afk] 🪪 menção resolvida de @lid p/ o número real ${numero} via ${via}`)
+            else console.warn('[afk] 🪪 menção @lid não resolvível — comparando o LID cru (best-effort)')
+          }
+          numerosAlvo.push(numero)
+        }
+
+        const { numero: numeroRemetente } = await resolverJidAfk(participantesAfk, sender)
+        // Só é "o próprio /afk" se for exatamente o comando (não /afkxyz etc.)
+        const ehComandoAfk = /^\/afk(\s|$)/i.test(text.trim())
+
+        // ⚡ UMA consulta só: remetente + todos os alvos de uma vez
+        const afkMapa = await buscarVariosAfk(
+          [numeroRemetente, ...numerosAlvo].filter(Boolean)
+        )
+
+        // ── 1) 👋 O REMETENTE estava AFK e voltou ──
+        // Se a mensagem é o próprio /afk, NÃO removemos: o comando apenas
+        // atualiza o motivo/timestamp (definirAfk cuida disso lá embaixo).
+        const docRemetente = afkMapa.get(numeroRemetente)
+        if (docRemetente && !(ehComandoAfk && jid === msg.key.remoteJid)) {
+          await removerAfk(numeroRemetente)
+          afkMapa.delete(numeroRemetente) // não avisar que ele "está ausente" na mesma msg
+          const tempoFora = formatarDuracao(Date.now() - (docRemetente.desde || Date.now()))
+          if (podeInteragir) await sock.sendMessage(jid, {
+            text:
+              `👋 Bem-vindo(a) de volta, @${numeroRemetente}! ` +
+              `Você estava ausente há *${tempoFora}*.`,
+            mentions: [msg.key.participant || jid].filter(Boolean)
+          }, { quoted: msg }).catch(() => {})
+        }
+
+        // ── 2) 💤 ALVOS (mencionados/respondidos) que estão AFK ──
+        // Em grupo: apenas os mencionados/respondidos. No privado: DECISÃO
+        // documentada acima — qualquer mensagem PARA um usuário AFK avisa.
+        const alvosParaAvisar = jid.endsWith('@g.us')
+          ? numerosAlvo
+          : [...numerosAlvo, numeroRemetente].filter((n) => n !== numeroRemetente)
+
+        const avisos = []
+        for (const numeroAlvo of alvosParaAvisar) {
+          const doc = afkMapa.get(numeroAlvo)
+          if (!doc) continue
+          const tempoAusente = formatarDuracao(Date.now() - (doc.desde || Date.now()))
+          avisos.push(
+            `💤 @${numeroAlvo} está ausente: ${doc.motivo || MOTIVO_PADRAO}\n` +
+            `_(ausente há ${tempoAusente})_`
+          )
+        }
+
+        if (podeInteragir && avisos.length) {
+          await sock.sendMessage(jid, {
+            text: avisos.join('\n\n'),
+            mentions: alvosParaAvisar
+              .filter((n) => afkMapa.has(n))
+              .map((n) => `${n}@s.whatsapp.net`)
+          }, { quoted: msg }).catch(() => {})
+        }
+      } catch (erroAfk) {
+        // 🛡️ A checagem de AFK NUNCA derruba o listener nem o fluxo de comandos
+        console.error('⚠️ [afk] falha na checagem de AFK (fluxo segue normal):', erroAfk?.message || erroAfk)
+      }
+      // 💤━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+      // OFF bloqueia só a interação manual: comandos, palpites e IA.
+      // Donos (JID/LID) continuam acessando inclusive /on. Sem aviso/spam.
+      if (!podeInteragir) return
+
+      // Consulta pública sem prefixo. Moderação e manutenção já verificadas;
+      // consumir também em cooldown impede votos/palpites e respostas da IA.
+      if (await respostaPrefixo.processar(sock, jid, msg, text)) return
+
+      // 🎮 TEXTO LIVRE PARA JOGOS — mensagens que NÃO são comandos (isto é,
+      //      que não começam com o prefixo configurado) podem ser palpites de
+      //      uma partida ativa no grupo (ex.: /gartic). O registro
+      //      compartilhado (dados/jogos-ativos.js) decide se há um ouvinte
+      //      interessado; se a mensagem for consumida, paramos aqui. O fluxo
+      //      normal de comandos abaixo nem é tocado.
+      //
+      // 🔤 PREFIXO DINÂMICO (prefixo.js): o "/" NÃO é mais fixo aqui — o que
+      //      vale é o prefixo salvo no MongoDB (troca em tempo real pelo
+      //      /set-prefix). `null` = não é comando (cai no texto livre abaixo);
+      //      `''` = o prefixo sozinho, sem nome (ex.: "/" ou "!").
+      await prefixoComandos.obterPrefixo()
+      const nomeComando = prefixoComandos.resolverNomeComando(text)
+
+      if (nomeComando === null) {
+        try {
+          if (await processarMensagemLivre(sock, jid, msg, text)) return
+        } catch (errPalpite) {
+          // 🛡️ Um ouvinte problemático nunca derruba o listener do Baileys
+          console.error('❌ Erro ao processar palpite de jogo:', errPalpite)
+        }
+
+        // 🤖 IA INTERATIVA (ia-interativa.js) — só responde se:
+        //   a) alguém mencionou o bot (@numero-do-bot), OU
+        //   b) alguém respondeu (reply) a uma mensagem enviada pelo bot;
+        //   e o /ia-interativa 1 estiver ligado NESTE grupo (MongoDB).
+        // ⚠️ Chamada SEM await DE PROPÓSITO: a API pode levar até 18s e o
+        // handler não pode ficar preso (o bot precisa seguir recebendo
+        // mensagens). A função nunca lança: qualquer falha é silenciosa.
+        processarGatilhoIA(sock, jid, msg, text).catch((errIA) => {
+          console.error('❌ Erro na IA interativa:', errIA)
+        })
+        return
+      }
+
+      // Prefixo sem nome de comando (ex.: "/" ou "!"): o bot ignora em
+      // silêncio — igual à barra fixa de antes.
+      if (!nomeComando) return
+
+      const comando = comandos.get(nomeComando)
+
+      if (!comando) return
+
+      if (jid.endsWith('@g.us')) {
+        const caminhoConfigs = path.join(__dirname, 'comandos', 'dados', 'antias.json');
+        if (fs.existsSync(caminhoConfigs)) {
+          const configs = JSON.parse(fs.readFileSync(caminhoConfigs, 'utf-8'));
+          
+          if (configAtiva(configs, 'onlyAdmin', 'onlyadmin', jid)) {
+            // 🔒 MODO SOMENTE ADMIN (/soadm) — para ESTE grupo específico
+            // Quando ativo, apenas administradores (ou o dono do bot) podem usar
+            // os comandos. Não-admins são ignorados (ou avisados, se config).
+            // (dono = qualquer número da lista OWNER_NUMBERS do config.js)
+            // Reutiliza a autorização JID/LID da manutenção, incluindo a
+            // sessão quando os metadados não trazem o telefone do dono.
+            if (!(await estadoBot.remetenteEhDono(sock, jid, sender))) {
+              let metadados = null
+              try {
+                metadados = await sock.groupMetadata(jid)
+              } catch (err) {
+                // Sem metadados não dá pra provar que é admin -> bloqueia
+                console.error('Erro ao buscar metadados no modo restrito:', err)
+              }
+
+              const ehAdmin = ehAdminDoGrupo(metadados?.participants, sender)
+
+              if (!ehAdmin) {
+                if (AVISAR_BLOQUEIO) {
+                  await sock.sendMessage(jid, {
+                    text: '🛡️ *MODO RESTRITO ATIVO*\n\nApenas *administradores do grupo* podem invocar os comandos de Hipnos enquanto o /soadm estiver ativo neste recinto. 💤'
+                  }, { quoted: msg })
+                }
+                return;
+              }
+            }
+          }
+        }
+      }
+
+      // 🛡️ ISOLAMENTO DE ERROS: nenhum comando pode derrubar o listener
+      // (messages.upsert) nem a conexão do Baileys com o WhatsApp.
+      // A chamada de CADA comando é envolvida em try/catch: um erro dentro
+      // de UM comando específico é apenas logado, o usuário recebe um aviso
+      // no chat e o bot segue rodando normalmente. O .catch() extra na
+      // mensagem de erro garante que nem a própria notificação de falha
+      // consiga vazar (rede fora, rate limit, etc.).
+      try {
+        await comando.executar(sock, jid, msg, text)
+      } catch (erro) {
+        console.error('❌ Erro no comando:', erro)
+        await sock.sendMessage(jid, {
+          text: '❌ Ocorreu um erro ao executar esse comando.'
+        }, { quoted: msg }).catch(() => {})
+      }
+
+    } catch (err) {
+      console.log('❌ Erro:')
+      console.log(err)
+    }
+  })
+
+  sock.ev.on('connection.update', (atualizacao) => {
+    const { connection, qr, lastDisconnect } = atualizacao
+
+    // Ignora eventos de sockets antigos que já foram substituídos/reiniciados
+    if (sockAtual !== sock) return
+
+    if (qr) {
+      // Mantém no terminal caso precise
+      qrcode.generate(qr, { small: true })
+      console.log('📱 Scan the QR Code above')
+      
+      // GERA A URL DA IMAGEM PARA O SEU NAVEGADOR
+      linkDoQrCode = `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(qr)}`;
+    }
+
+    if (connection === 'open') {
+      tentativas = 0
+      reconexaoAgendada = false
+      console.log('🌙 Hipnos Bot connected successfully!')
+      linkDoQrCode = ''; // Limpa o QR Code quando conectar
+
+      // ⏰ LEMBRETES: o socket pode ter sido recriado — registra o novo para
+      // o agendador disparar por ele (idempotente, não duplica o timer).
+      iniciarAgendadorLembretes(sock).catch((errLembretes) => {
+        console.error('⚠️ [lembretes] falha na verificação pós-reconexão:', errLembretes?.message || errLembretes)
+      })
+    }
+
+    if (connection === 'close') {
+      const codigo = lastDisconnect?.error?.output?.statusCode
+      console.log('❌ Conexão fechada')
+      console.log('Status do erro:', codigo, '| Motivo:', lastDisconnect?.error?.message)
+
+      // Não faz sentido reconectar quando a sessão foi encerrada ou corrompida
+      const sessaoInvalida =
+        codigo === DisconnectReason.loggedOut ||
+        codigo === DisconnectReason.badSession
+
+      console.log('Reconectar?', !sessaoInvalida)
+
+      if (sessaoInvalida) {
+        console.log('🚪 Sessão encerrada ou inválida. Reinicie o bot e escaneie o QR Code novamente.')
+        sockAtual = null
+        return
+      }
+
+      // Se já há uma reconexão agendada (eventos de close repetidos), ignora
+      if (reconexaoAgendada) {
+        console.log('⏳ Reconexão já agendada, ignorando este evento...')
+        return
+      }
+
+      reconexaoAgendada = true
+      tentativas += 1
+
+      // Backoff progressivo: 3s, 6s, 12s... até 60s no máximo
+      const espera = Math.min(3000 * Math.pow(2, tentativas - 1), 60000)
+      console.log(`🔄 Reconnecting em ${espera / 1000}s... (tentativa ${tentativas})`)
+
+      setTimeout(() => {
+        reconexaoAgendada = false
+        startBot().catch((err) => {
+          console.error('❌ Falha ao reconectar:', err)
+          reconexaoAgendada = false
+        })
+      }, espera)
+    }
+  })
+}
+
+startBot().catch((err) => {
+  console.error('❌ Falha ao iniciar o bot:', err)
+  reconexaoAgendada = false
+});
